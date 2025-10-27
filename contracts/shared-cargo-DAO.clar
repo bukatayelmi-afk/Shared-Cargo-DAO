@@ -8,6 +8,9 @@
 (define-constant ERR_BOOKING_NOT_FOUND (err u106))
 (define-constant ERR_BOOKING_EXPIRED (err u107))
 (define-constant ERR_INVALID_RATING (err u108))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u109))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u110))
+(define-constant ERR_INVALID_DISPUTE_STATUS (err u111))
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var platform-fee uint u250)
@@ -63,6 +66,23 @@
     { rater: principal, business-id: uint }
     { rating: uint, comment: (string-ascii 256), rated-at: uint }
 )
+
+(define-map disputes
+    uint
+    {
+        booking-id: uint,
+        raised-by: principal,
+        reason: (string-ascii 256),
+        status: (string-ascii 16),
+        resolution: (optional (string-ascii 256)),
+        refund-percentage: uint,
+        raised-at: uint,
+        resolved-at: (optional uint)
+    }
+)
+
+(define-map booking-disputes uint uint)
+(define-data-var next-dispute-id uint u1)
 
 (define-public (register-business (name (string-ascii 64)) (location (string-ascii 128)))
     (let
@@ -282,4 +302,80 @@
         total-bookings: (- (var-get next-booking-id) u1),
         platform-fee: (var-get platform-fee)
     }
+)
+
+(define-public (raise-dispute (booking-id uint) (reason (string-ascii 256)))
+    (let
+        (
+            (booking (unwrap! (map-get? bookings booking-id) ERR_BOOKING_NOT_FOUND))
+            (cargo-space-id (get cargo-space-id booking))
+            (cargo-space (unwrap! (map-get? cargo-spaces cargo-space-id) ERR_NOT_FOUND))
+            (business-id (get business-id cargo-space))
+            (business (unwrap! (map-get? businesses business-id) ERR_NOT_FOUND))
+            (existing-dispute (map-get? booking-disputes booking-id))
+            (dispute-id (var-get next-dispute-id))
+        )
+        (asserts! (or (is-eq tx-sender (get buyer booking)) (is-eq tx-sender (get owner business))) ERR_UNAUTHORIZED)
+        (asserts! (is-none existing-dispute) ERR_DISPUTE_ALREADY_EXISTS)
+        (asserts! (or (is-eq (get status booking) "booked") (is-eq (get status booking) "completed")) ERR_INVALID_DISPUTE_STATUS)
+        
+        (map-set disputes dispute-id
+            {
+                booking-id: booking-id,
+                raised-by: tx-sender,
+                reason: reason,
+                status: "open",
+                resolution: none,
+                refund-percentage: u0,
+                raised-at: stacks-block-height,
+                resolved-at: none
+            }
+        )
+        
+        (map-set booking-disputes booking-id dispute-id)
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-ascii 256)) (refund-percentage uint))
+    (let
+        (
+            (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+            (booking-id (get booking-id dispute))
+            (booking (unwrap! (map-get? bookings booking-id) ERR_BOOKING_NOT_FOUND))
+            (total-cost (get total-cost booking))
+            (refund-amount (/ (* total-cost refund-percentage) u100))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status dispute) "open") ERR_INVALID_DISPUTE_STATUS)
+        (asserts! (<= refund-percentage u100) ERR_INVALID_AMOUNT)
+        
+        (if (> refund-amount u0)
+            (try! (as-contract (stx-transfer? refund-amount tx-sender (get buyer booking))))
+            true
+        )
+        
+        (map-set disputes dispute-id
+            (merge dispute {
+                status: "resolved",
+                resolution: (some resolution),
+                refund-percentage: refund-percentage,
+                resolved-at: (some stacks-block-height)
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-dispute-by-booking (booking-id uint))
+    (match (map-get? booking-disputes booking-id)
+        dispute-id (map-get? disputes dispute-id)
+        none
+    )
 )
